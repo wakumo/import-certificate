@@ -117,5 +117,3 @@ sudo /usr/bin/security add-trusted-cert -d -r trustRoot \
   -k /Library/Keychains/System.keychain "$cert"
 /usr/bin/security verify-cert -c "$cert" -p basic
 printf '\nRoot CA installed and verified. Fully quit and reopen your browser.\n'
-printf 'Connect to Headscale and visit https://wiki.wakumo.network\n'
-printf 'Firefox may require a separate CA import. This does not test website connectivity.\n'
