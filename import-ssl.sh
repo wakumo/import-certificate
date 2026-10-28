@@ -4,7 +4,6 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 # Public certificate only. Review the fingerprint through a trusted channel.
-expected='3E:0C:8C:41:D8:C0:17:84:59:96:97:FA:40:8B:D4:0D:4E:C6:00:FF:24:A8:75:0B:D9:49:AF:F0:E8:9F:EF:EF'
 check_only=false
 cert_file=''
 while [ "$#" -gt 0 ]; do
@@ -28,7 +27,7 @@ while [ "$#" -gt 0 ]; do
     --help)
       printf 'Usage: %s --file PATH_OR_HTTPS_URL [--check]\n' "$0"
       printf 'Accepts a local certificate or HTTPS URL (including standard GitHub blob URLs).\n'
-      printf 'Install the pinned wiki Root CA on macOS. --check validates without changing trust.\n'
+      printf 'Install one public self-signed Root CA (PEM or DER) on macOS. --check validates without changing trust.\n'
       exit 0
       ;;
     *)
@@ -60,11 +59,11 @@ if [ "$(uname -s)" != Darwin ]; then
 fi
 
 umask 077
-temp_dir=$(mktemp -d /private/tmp/wakumo-wiki-ca.XXXXXX)
+temp_dir=$(mktemp -d /private/tmp/root-ca.XXXXXX)
 trap 'rm -rf "$temp_dir"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-cert="$temp_dir/root-ca.crt"
+cert="$temp_dir/source.crt"
 # Validate and import the same private snapshot of the supplied certificate.
 case "$cert_file" in
   https://*)
@@ -82,35 +81,51 @@ case "$cert_file" in
   *) cp -- "$cert_file" "$cert" ;;
 esac
 
-if ! actual=$(openssl x509 -in "$cert" -noout -fingerprint -sha256); then
-  printf 'Invalid certificate (possibly an HTML sign-in page); use an accessible raw HTTPS URL or a local file.\n' >&2
+invalid_certificate() {
+  printf 'Invalid input: supply exactly one public Root CA certificate in PEM or DER, without private keys or extra data.\n' >&2
+  exit 1
+}
+
+# OpenSSL reads only the first certificate. Compare the full input against its
+# re-encoding so bundles, private keys, and trailing data cannot be ignored.
+if openssl x509 -inform PEM -in "$cert" -out "$temp_dir/root-ca.pem" 2>/dev/null; then
+  LC_ALL=C tr -d '[:space:]' < "$cert" > "$temp_dir/input.compact"
+  LC_ALL=C tr -d '[:space:]' < "$temp_dir/root-ca.pem" > "$temp_dir/output.compact"
+  cmp -s "$temp_dir/input.compact" "$temp_dir/output.compact" || invalid_certificate
+else
+  openssl x509 -inform DER -in "$cert" -out "$temp_dir/root-ca.pem" 2>/dev/null || invalid_certificate
+  openssl x509 -in "$temp_dir/root-ca.pem" -outform DER -out "$temp_dir/root-ca.der"
+  cmp -s "$cert" "$temp_dir/root-ca.der" || invalid_certificate
+fi
+cert="$temp_dir/root-ca.pem"
+details=$(openssl x509 -in "$cert" -noout -text)
+constraints=$(printf '%s\n' "$details" | awk '/^[[:space:]]*X509v3 Basic Constraints:/ { getline; print }')
+if ! printf '%s\n' "$constraints" | grep -Eq '(^|[[:space:],])CA:TRUE([[:space:],]|$)'; then
+  printf 'Certificate must have CA:TRUE basic constraints.\n' >&2
   exit 1
 fi
-actual=${actual#*=}
-if [ "$actual" != "$expected" ]; then
-  printf 'Certificate fingerprint mismatch; refusing to install.\n' >&2
+usage=$(printf '%s\n' "$details" | awk '/^[[:space:]]*X509v3 Key Usage:/ { getline; print }')
+if [ -n "$usage" ] && ! printf '%s\n' "$usage" | grep -Eq '(^|[[:space:],])Certificate Sign([[:space:],]|$)'; then
+  printf 'Certificate key usage must allow certificate signing.\n' >&2
+  exit 1
+fi
+subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253)
+issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253)
+if [ "${subject#*=}" != "${issuer#*=}" ]; then
+  printf 'Certificate must be a self-signed Root CA (subject must match issuer).\n' >&2
   exit 1
 fi
 openssl x509 -in "$cert" -checkend 0 -noout
-openssl verify -CAfile "$cert" "$cert"
+# Explicitly check the trust anchor signature as well as its validity dates.
+openssl verify -check_ss_sig -CAfile "$cert" "$cert"
 openssl x509 -in "$cert" -noout -subject -dates -fingerprint -sha256
 if [ "$check_only" = true ]; then
   printf 'Certificate checks passed. No trust settings changed.\n'
   exit 0
 fi
 
-printf '\nThis installs a private Root CA into the macOS System Keychain.\n'
-printf 'It can authenticate names beyond wiki.wakumo.network.\n'
-printf 'Only proceed if you trust your company CA administrator and this script.\n'
-printf 'Type INSTALL to continue: '
-if ! IFS= read -r answer </dev/tty; then
-  printf '\nAn interactive terminal is required.\n' >&2
-  exit 1
-fi
-if [ "$answer" != INSTALL ]; then
-  printf 'Cancelled. No trust settings changed.\n'
-  exit 0
-fi
+printf '\nWarning: installing this Root CA into the macOS System Keychain allows it to authenticate any domain.\n'
+printf 'Only install a CA you trust. sudo may request your password.\n'
 
 # Reapplying the same certificate updates its trust without removing other CAs.
 sudo /usr/bin/security add-trusted-cert -d -r trustRoot \
